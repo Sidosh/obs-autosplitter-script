@@ -4,10 +4,16 @@ On load, starts the OBS Virtual Camera and determines which cv2 (OpenCV)
 device index it is reachable under, so frames can later be captured with
 cv2.VideoCapture(camera_index, cv2.CAP_DSHOW).
 
-Dependencies (opencv-python, pygrabber) are installed automatically into
-the user site-packages of OBS's configured Python when missing. Manual
-install, if ever needed:
-    C:\Python311\python.exe -m pip install --user opencv-python pygrabber
+Also keeps a WebSocket connection to the LiveSplit server open
+(ws://<host>:<port>/livesplit, default port 16834) and reconnects
+automatically. The WS server must be started inside LiveSplit first:
+right click LiveSplit -> Control -> Start WS Server. Timer commands
+(starttimer, split, ...) are sent with livesplit_send().
+
+Dependencies (opencv-python, pygrabber, websocket-client) are installed
+automatically into the user site-packages of OBS's configured Python
+when missing. Manual install, if ever needed:
+    C:\Python311\python.exe -m pip install --user opencv-python pygrabber websocket-client
 pygrabber finds the camera by its DirectShow device name; without it the
 script falls back to probing every index.
 """
@@ -27,11 +33,16 @@ RETRY_INTERVAL_MS = 1000
 MAX_START_ATTEMPTS = 15
 PROBE_MAX_INDEX = 10
 PIP_TIMEOUT_S = 600
+LIVESPLIT_RETRY_S = 5
+LIVESPLIT_CONNECT_TIMEOUT_S = 5
+# recv() timeout; also how quickly the worker notices a stop request.
+LIVESPLIT_RECV_TIMEOUT_S = 1
 
 # import name -> pip package name
 REQUIRED_PACKAGES = {
     "cv2": "opencv-python",
     "pygrabber": "pygrabber",
+    "websocket": "websocket-client",
 }
 
 camera_index = -1
@@ -39,6 +50,13 @@ start_attempts = 0
 started_by_script = False
 unloading = False
 detect_thread = None
+deps_lock = threading.Lock()
+
+livesplit_url = ""
+livesplit_thread = None
+livesplit_stop = None
+livesplit_lock = threading.Lock()
+livesplit_conn = None  # connected WebSocket, guarded by livesplit_lock
 
 
 def get_camera_index():
@@ -54,50 +72,53 @@ def log(level, msg):
 def ensure_dependencies():
     """Install missing packages via pip into the user site-packages.
 
-    Runs on the worker thread, so OBS stays responsive during the
-    download/install.
+    Runs on a worker thread, so OBS stays responsive during the
+    download/install. deps_lock keeps concurrent workers (camera
+    detection, LiveSplit connection) from racing pip.
     """
-    missing = [pkg for mod, pkg in REQUIRED_PACKAGES.items()
-               if importlib.util.find_spec(mod) is None]
-    if not missing:
+    with deps_lock:
+        missing = [pkg for mod, pkg in REQUIRED_PACKAGES.items()
+                   if importlib.util.find_spec(mod) is None]
+        if not missing:
+            return True
+
+        # In OBS's embedded interpreter sys.executable is obs64.exe, so pip
+        # must be run through the configured Python install (sys.base_prefix).
+        python_exe = os.path.join(sys.base_prefix, "python.exe")
+        if not os.path.isfile(python_exe):
+            log(obs.LOG_ERROR,
+                f"Cannot auto-install {missing}: python.exe not found in "
+                f"{sys.base_prefix}. Install manually with: "
+                f"pip install --user {' '.join(missing)}")
+            return False
+
+        log(obs.LOG_INFO,
+            f"Installing missing packages: {', '.join(missing)} "
+            "(this can take a minute)...")
+        try:
+            # --user: the Python install dir is usually not writable without
+            # admin rights.
+            result = subprocess.run(
+                [python_exe, "-m", "pip", "install", "--user", *missing],
+                capture_output=True, text=True, timeout=PIP_TIMEOUT_S,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log(obs.LOG_ERROR, f"Could not run pip install: {e}")
+            return False
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout
+                    or "").strip().splitlines()[-5:]
+            log(obs.LOG_ERROR, "pip install failed:\n" + "\n".join(tail))
+            return False
+
+        # A fresh --user install may land in a directory that was not on
+        # sys.path when the interpreter started.
+        user_site = site.getusersitepackages()
+        if user_site not in sys.path:
+            sys.path.insert(0, user_site)
+        importlib.invalidate_caches()
+        log(obs.LOG_INFO, f"Installed {', '.join(missing)}")
         return True
-
-    # In OBS's embedded interpreter sys.executable is obs64.exe, so pip
-    # must be run through the configured Python install (sys.base_prefix).
-    python_exe = os.path.join(sys.base_prefix, "python.exe")
-    if not os.path.isfile(python_exe):
-        log(obs.LOG_ERROR,
-            f"Cannot auto-install {missing}: python.exe not found in "
-            f"{sys.base_prefix}. Install manually with: "
-            f"pip install --user {' '.join(missing)}")
-        return False
-
-    log(obs.LOG_INFO,
-        f"Installing missing packages: {', '.join(missing)} "
-        "(this can take a minute)...")
-    try:
-        # --user: the Python install dir is usually not writable without
-        # admin rights.
-        result = subprocess.run(
-            [python_exe, "-m", "pip", "install", "--user", *missing],
-            capture_output=True, text=True, timeout=PIP_TIMEOUT_S,
-            creationflags=subprocess.CREATE_NO_WINDOW)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        log(obs.LOG_ERROR, f"Could not run pip install: {e}")
-        return False
-    if result.returncode != 0:
-        tail = (result.stderr or result.stdout or "").strip().splitlines()[-5:]
-        log(obs.LOG_ERROR, "pip install failed:\n" + "\n".join(tail))
-        return False
-
-    # A fresh --user install may land in a directory that was not on
-    # sys.path when the interpreter started.
-    user_site = site.getusersitepackages()
-    if user_site not in sys.path:
-        sys.path.insert(0, user_site)
-    importlib.invalidate_caches()
-    log(obs.LOG_INFO, f"Installed {', '.join(missing)}")
-    return True
 
 
 def find_index_by_name():
@@ -220,15 +241,153 @@ def redetect_clicked(props, prop):
     return False
 
 
+# --- LiveSplit WebSocket connection ------------------------------------------
+
+def livesplit_send(command):
+    """Send a timer command (e.g. 'startorsplit', 'split') to LiveSplit.
+
+    Returns True if the command was written to the socket. Responses to
+    query commands (e.g. 'getcurrenttimerphase') arrive asynchronously
+    and are written to the script log by the receive loop.
+    """
+    with livesplit_lock:
+        conn = livesplit_conn
+    if conn is None:
+        log(obs.LOG_WARNING,
+            f"Not connected to LiveSplit, dropped command '{command}'")
+        return False
+    try:
+        conn.send(command)
+        return True
+    except Exception as e:
+        log(obs.LOG_WARNING, f"Sending '{command}' to LiveSplit failed: {e}")
+        return False
+
+
+def livesplit_worker(url, stop):
+    """Keeps a WebSocket connection to the LiveSplit server alive.
+
+    Connects and reconnects until `stop` is set (script unload or a
+    settings change, which starts a fresh worker for the new URL).
+    """
+    global livesplit_conn
+
+    if not ensure_dependencies():
+        return
+    try:
+        import websocket
+    except ImportError:
+        log(obs.LOG_ERROR,
+            "websocket-client is not installed in OBS's Python "
+            "(pip install --user websocket-client)")
+        return
+
+    failure_logged = False
+    while not stop.is_set():
+        try:
+            conn = websocket.create_connection(
+                url, timeout=LIVESPLIT_CONNECT_TIMEOUT_S)
+        except Exception as e:
+            if not failure_logged:
+                log(obs.LOG_WARNING,
+                    f"Cannot reach LiveSplit at {url} ({e}). Make sure the "
+                    "WS server is running: right click LiveSplit -> Control "
+                    "-> Start WS Server. Retrying every "
+                    f"{LIVESPLIT_RETRY_S}s...")
+                failure_logged = True
+            stop.wait(LIVESPLIT_RETRY_S)
+            continue
+
+        failure_logged = False
+        conn.settimeout(LIVESPLIT_RECV_TIMEOUT_S)
+        with livesplit_lock:
+            livesplit_conn = conn
+        log(obs.LOG_INFO, f"Connected to LiveSplit at {url}")
+
+        try:
+            while not stop.is_set():
+                try:
+                    msg = conn.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                if msg:
+                    log(obs.LOG_INFO, f"LiveSplit: {msg}")
+                elif not conn.connected:  # server sent a close frame
+                    break
+        except Exception:
+            pass  # connection dropped; outer loop reconnects
+        finally:
+            with livesplit_lock:
+                if livesplit_conn is conn:
+                    livesplit_conn = None
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if not stop.is_set():
+            log(obs.LOG_WARNING, "LiveSplit connection lost, reconnecting...")
+
+
+def close_livesplit_conn():
+    with livesplit_lock:
+        conn = livesplit_conn
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def restart_livesplit_worker():
+    """Start the connection worker, stopping the previous one first."""
+    global livesplit_thread, livesplit_stop
+
+    if livesplit_stop is not None:
+        livesplit_stop.set()
+    close_livesplit_conn()  # unblock the old worker's recv() immediately
+
+    livesplit_stop = threading.Event()
+    livesplit_thread = threading.Thread(
+        target=livesplit_worker, args=(livesplit_url, livesplit_stop),
+        daemon=True)
+    livesplit_thread.start()
+
+
+def test_livesplit_clicked(props, prop):
+    if livesplit_send("getcurrenttimerphase"):
+        log(obs.LOG_INFO,
+            "Sent 'getcurrenttimerphase'; the response appears in this log")
+    return False
+
+
 # --- OBS script entry points -------------------------------------------------
 
 def script_description():
     return ("<b>Autosplitter</b><br/>"
             "Starts the OBS Virtual Camera on load and detects its cv2 "
             "camera index.<br/>"
+            "Connects to the LiveSplit WS server (start it via right click "
+            "on LiveSplit &rarr; Control &rarr; Start WS Server).<br/>"
             "Missing dependencies (<code>opencv-python</code>, "
-            "<code>pygrabber</code>) are installed automatically on first "
-            "run; see the script log for progress.")
+            "<code>pygrabber</code>, <code>websocket-client</code>) are "
+            "installed automatically on first run; see the script log for "
+            "progress.")
+
+
+def script_defaults(settings):
+    obs.obs_data_set_default_string(settings, "livesplit_host", "localhost")
+    obs.obs_data_set_default_int(settings, "livesplit_port", 16834)
+
+
+def script_update(settings):
+    global livesplit_url
+
+    host = obs.obs_data_get_string(settings, "livesplit_host").strip()
+    port = obs.obs_data_get_int(settings, "livesplit_port")
+    url = f"ws://{host or 'localhost'}:{port or 16834}/livesplit"
+    if url != livesplit_url:
+        livesplit_url = url
+        restart_livesplit_worker()
 
 
 def script_load(settings):
@@ -245,6 +404,9 @@ def script_unload():
     global unloading
     unloading = True
     obs.timer_remove(startup_tick)
+    if livesplit_stop is not None:
+        livesplit_stop.set()
+    close_livesplit_conn()
     if started_by_script and obs.obs_frontend_virtualcam_active():
         obs.obs_frontend_stop_virtualcam()
 
@@ -253,4 +415,11 @@ def script_properties():
     props = obs.obs_properties_create()
     obs.obs_properties_add_button(props, "redetect",
                                   "Re-detect camera index", redetect_clicked)
+    obs.obs_properties_add_text(props, "livesplit_host", "LiveSplit host",
+                                obs.OBS_TEXT_DEFAULT)
+    obs.obs_properties_add_int(props, "livesplit_port", "LiveSplit port",
+                               1, 65535, 1)
+    obs.obs_properties_add_button(props, "livesplit_test",
+                                  "Test LiveSplit connection",
+                                  test_livesplit_clicked)
     return props
