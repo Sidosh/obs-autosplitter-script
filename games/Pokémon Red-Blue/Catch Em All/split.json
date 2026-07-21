@@ -1,0 +1,4 @@
+{
+    "start": {"images": ["start_001.png"], "delay": 27800},
+    "0": {"images": ["001_001.png", "001_002.png", "001_003.png"], "delay": 100}
+}
