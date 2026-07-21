@@ -21,11 +21,16 @@ script falls back to probing every index.
 import ctypes
 import importlib
 import importlib.util
+import json
 import os
 import site
 import subprocess
 import sys
 import threading
+import time
+import urllib.error
+import urllib.request
+from urllib.parse import quote
 
 import obspython as obs
 
@@ -37,6 +42,21 @@ LIVESPLIT_RETRY_S = 5
 LIVESPLIT_CONNECT_TIMEOUT_S = 5
 # recv() timeout; also how quickly the worker notices a stop request.
 LIVESPLIT_RECV_TIMEOUT_S = 1
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+GAMES_DIR = os.path.join(SCRIPT_DIR, "games")
+
+# Games bundled in the script's own repo are also offered even when not
+# downloaded yet; picking one fetches it into GAMES_DIR for local/offline use.
+GITHUB_OWNER = "Sidosh"
+GITHUB_REPO = "obs-autosplitter-script"
+GITHUB_BRANCH = "main"
+GITHUB_API_BASE = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents"
+GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}"
+GITHUB_TIMEOUT_S = 5
+# Avoids hitting GitHub's unauthenticated rate limit when the properties
+# dialog is reopened or the game/category dropdowns are toggled repeatedly.
+GITHUB_CACHE_TTL_S = 60
 
 # import name -> pip package name
 REQUIRED_PACKAGES = {
@@ -57,6 +77,14 @@ livesplit_thread = None
 livesplit_stop = None
 livesplit_lock = threading.Lock()
 livesplit_conn = None  # connected WebSocket, guarded by livesplit_lock
+
+# path (relative to the repo root) -> (fetched_at, GitHub API 'contents' entries)
+_github_contents_cache = {}
+
+# Settings from the last script_load()/script_update(), kept so
+# script_properties() can populate the category list for the game that is
+# already selected when the properties dialog is (re)opened.
+current_settings = None
 
 
 def get_camera_index():
@@ -360,6 +388,143 @@ def test_livesplit_clicked(props, prop):
     return False
 
 
+# --- Game / category selection ------------------------------------------------
+
+def list_subdirs(path):
+    """Names of the immediate subdirectories of `path`, sorted; [] if missing."""
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return []
+    return sorted((name for name in entries if os.path.isdir(os.path.join(path, name))),
+                  key=str.casefold)
+
+
+def github_contents(path):
+    """GitHub API 'contents' listing for `path` in the repo, cached briefly.
+
+    Returns [] on any failure (offline, rate-limited, path doesn't exist)
+    so the game/category dropdowns still work with local-only folders.
+    """
+    now = time.monotonic()
+    cached = _github_contents_cache.get(path)
+    if cached is not None and now - cached[0] < GITHUB_CACHE_TTL_S:
+        return cached[1]
+
+    url = f"{GITHUB_API_BASE}/{quote(path)}?ref={GITHUB_BRANCH}"
+    try:
+        with urllib.request.urlopen(url, timeout=GITHUB_TIMEOUT_S) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log(obs.LOG_WARNING, f"Could not list GitHub path '{path}' ({e})")
+        data = []
+    entries = data if isinstance(data, list) else []
+    _github_contents_cache[path] = (now, entries)
+    return entries
+
+
+def github_list_dirnames(path):
+    return [entry["name"] for entry in github_contents(path)
+            if entry.get("type") == "dir"]
+
+
+def github_list_filenames(path):
+    return [entry["name"] for entry in github_contents(path)
+            if entry.get("type") == "file"]
+
+
+def list_games():
+    names = set(list_subdirs(GAMES_DIR)) | set(github_list_dirnames("games"))
+    return sorted(names, key=str.casefold)
+
+
+def list_categories(game):
+    if not game:
+        return []
+    local = list_subdirs(os.path.join(GAMES_DIR, game))
+    remote = github_list_dirnames(f"games/{game}")
+    return sorted(set(local) | set(remote), key=str.casefold)
+
+
+def fill_game_list(prop):
+    obs.obs_property_list_clear(prop)
+    for name in list_games():
+        obs.obs_property_list_add_string(prop, name, name)
+
+
+def fill_category_list(prop, game):
+    obs.obs_property_list_clear(prop)
+    for name in list_categories(game):
+        obs.obs_property_list_add_string(prop, name, name)
+
+
+def category_exists_locally(game, category):
+    return os.path.isdir(os.path.join(GAMES_DIR, game, category))
+
+
+def github_download_file(remote_path, local_path):
+    url = f"{GITHUB_RAW_BASE}/{quote(remote_path)}"
+    try:
+        with urllib.request.urlopen(url, timeout=GITHUB_TIMEOUT_S) as resp:
+            data = resp.read()
+    except (urllib.error.URLError, OSError) as e:
+        log(obs.LOG_WARNING, f"Could not download '{remote_path}' from GitHub ({e})")
+        return False
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    try:
+        with open(local_path, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        log(obs.LOG_WARNING, f"Could not save '{local_path}' ({e})")
+        return False
+    return True
+
+
+def download_category_worker(game, category):
+    """Fetches one category's split.json + images from GitHub into GAMES_DIR.
+
+    Runs on its own thread so the properties dialog doesn't block on
+    network I/O; afterwards the category is a normal local one.
+    """
+    remote_base = f"games/{game}/{category}"
+    local_base = os.path.join(GAMES_DIR, game, category)
+
+    ok = github_download_file(f"{remote_base}/split.json",
+                              os.path.join(local_base, "split.json"))
+    for name in github_list_filenames(f"{remote_base}/images"):
+        ok = github_download_file(f"{remote_base}/images/{name}",
+                                  os.path.join(local_base, "images", name)) and ok
+
+    if ok:
+        log(obs.LOG_INFO, f"Downloaded '{game}/{category}' from GitHub")
+    else:
+        log(obs.LOG_WARNING,
+            f"'{game}/{category}' download from GitHub finished with errors")
+
+
+def download_category_if_missing(game, category):
+    if not game or not category or category_exists_locally(game, category):
+        return
+    log(obs.LOG_INFO, f"'{game}/{category}' not found locally, downloading from GitHub...")
+    threading.Thread(target=download_category_worker, args=(game, category),
+                     daemon=True).start()
+
+
+def category_changed(props, prop, settings):
+    """Fetches the selected category from GitHub if not already local."""
+    game = obs.obs_data_get_string(settings, "game")
+    category = obs.obs_data_get_string(settings, "category")
+    download_category_if_missing(game, category)
+    return False
+
+
+def game_changed(props, prop, settings):
+    """Refreshes the category list to match the newly selected game."""
+    game = obs.obs_data_get_string(settings, "game")
+    fill_category_list(obs.obs_properties_get(props, "category"), game)
+    return True
+
+
 # --- OBS script entry points -------------------------------------------------
 
 def script_description():
@@ -380,7 +545,8 @@ def script_defaults(settings):
 
 
 def script_update(settings):
-    global livesplit_url
+    global livesplit_url, current_settings
+    current_settings = settings
 
     host = obs.obs_data_get_string(settings, "livesplit_host").strip()
     port = obs.obs_data_get_int(settings, "livesplit_port")
@@ -391,10 +557,11 @@ def script_update(settings):
 
 
 def script_load(settings):
-    global camera_index, start_attempts, unloading
+    global camera_index, start_attempts, unloading, current_settings
     camera_index = -1
     start_attempts = 0
     unloading = False
+    current_settings = settings
     # Delay startup via a timer: at OBS launch the frontend may not be
     # ready yet, and the timer also retries until the camera is active.
     obs.timer_add(startup_tick, RETRY_INTERVAL_MS)
@@ -413,6 +580,20 @@ def script_unload():
 
 def script_properties():
     props = obs.obs_properties_create()
+
+    game_prop = obs.obs_properties_add_list(
+        props, "game", "Game",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    category_prop = obs.obs_properties_add_list(
+        props, "category", "Category",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    fill_game_list(game_prop)
+    selected_game = (obs.obs_data_get_string(current_settings, "game")
+                      if current_settings else "")
+    fill_category_list(category_prop, selected_game)
+    obs.obs_property_set_modified_callback(game_prop, game_changed)
+    obs.obs_property_set_modified_callback(category_prop, category_changed)
+
     obs.obs_properties_add_button(props, "redetect",
                                   "Re-detect camera index", redetect_clicked)
     obs.obs_properties_add_text(props, "livesplit_host", "LiveSplit host",
