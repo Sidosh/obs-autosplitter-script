@@ -6,9 +6,10 @@ cv2.VideoCapture(camera_index, cv2.CAP_DSHOW).
 
 Also keeps a WebSocket connection to the LiveSplit server open
 (ws://<host>:<port>/livesplit, default port 16834) and reconnects
-automatically. The WS server must be started inside LiveSplit first:
-right click LiveSplit -> Control -> Start WS Server. Timer commands
-(starttimer, split, ...) are sent with livesplit_send().
+automatically, used for the "Test LiveSplit connection" button
+(livesplit_send()). The WS server must be started inside LiveSplit first:
+right click LiveSplit -> Control -> Start WS Server. Actual splits are
+sent over their own connection by the --autosplit subprocess (see below).
 
 Dependencies (opencv-python, pygrabber, websocket-client) are installed
 automatically into the user site-packages of OBS's configured Python
@@ -16,6 +17,13 @@ when missing. Manual install, if ever needed:
     C:\Python311\python.exe -m pip install --user opencv-python pygrabber websocket-client
 pygrabber finds the camera by its DirectShow device name; without it the
 script falls back to probing every index.
+
+The actual autosplitting (camera reads + template matching) runs in a
+separate `python.exe --autosplit ...` subprocess of this same file rather
+than on a thread inside OBS: cv2.VideoCapture(CAP_DSHOW) only receives
+real frames from the OBS Virtual Camera when opened from outside OBS's
+own process, so a reader living inside OBS's process gets nothing but
+blank frames. See standalone_autosplit_main() and restart_autosplit_process().
 """
 
 import ctypes
@@ -32,7 +40,12 @@ import urllib.error
 import urllib.request
 from urllib.parse import quote
 
-import obspython as obs
+try:
+    import obspython as obs
+    OBS_LOG_LEVELS = {"INFO": obs.LOG_INFO, "WARNING": obs.LOG_WARNING, "ERROR": obs.LOG_ERROR}
+except ImportError:
+    obs = None  # running standalone as the --autosplit subprocess
+    OBS_LOG_LEVELS = {}
 
 RETRY_INTERVAL_MS = 1000
 MAX_START_ATTEMPTS = 15
@@ -43,7 +56,8 @@ LIVESPLIT_CONNECT_TIMEOUT_S = 5
 # recv() timeout; also how quickly the worker notices a stop request.
 LIVESPLIT_RECV_TIMEOUT_S = 1
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_PATH = os.path.abspath(__file__)
+SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
 GAMES_DIR = os.path.join(SCRIPT_DIR, "games")
 SPLITS_FILENAME = "splits.json"
 
@@ -57,7 +71,11 @@ MATCH_THRESHOLD = 0.9
 # unrelated on-screen changes (fewer false positives).
 # How often the autosplitter re-reads the camera while a split's images
 # haven't matched yet.
-FRAME_POLL_INTERVAL_S = 0.1
+FRAME_POLL_INTERVAL_S = 0.01
+# How often a non-matching score is logged while waiting on a split image,
+# so misfires can be diagnosed from the script log without needing to
+# reproduce them under helper/preview_matches.py.
+SCORE_LOG_INTERVAL_S = 2
 # How often the autosplitter checks whether the camera index / the
 # selected category's local files have become available.
 AUTOSPLIT_WAIT_S = 1
@@ -97,12 +115,12 @@ livesplit_conn = None  # connected WebSocket, guarded by livesplit_lock
 # path (relative to the repo root) -> (fetched_at, GitHub API 'contents' entries)
 _github_contents_cache = {}
 
-# game/category currently armed in the autosplit worker (script_update
-# restarts the worker when these no longer match the settings).
+# game/category currently armed in the autosplit subprocess (script_update
+# restarts it when these, or the LiveSplit URL, no longer match the settings).
 autosplit_game = ""
 autosplit_category = ""
-autosplit_thread = None
-autosplit_stop = None
+autosplit_process = None  # subprocess.Popen of `python.exe script.py --autosplit ...`
+autosplit_reader_thread = None
 
 # Settings from the last script_load()/script_update(), kept so
 # script_properties() can populate the category list for the game that is
@@ -116,8 +134,18 @@ def get_camera_index():
 
 
 def log(level, msg):
+    """Logs `msg` at `level` ("INFO"/"WARNING"/"ERROR").
+
+    Inside OBS, goes to obs.script_log(). Standalone (the --autosplit
+    subprocess, where `obs` is None), goes to stdout instead, prefixed with
+    the level, so read_autosplit_output() in the OBS-side process can
+    relay it back into the script log at the right level.
+    """
+    if obs is None:
+        print(f"{level}: {msg}", flush=True)
+        return
     if not unloading:
-        obs.script_log(level, msg)
+        obs.script_log(OBS_LOG_LEVELS[level], msg)
 
 
 def ensure_dependencies():
@@ -137,13 +165,13 @@ def ensure_dependencies():
         # must be run through the configured Python install (sys.base_prefix).
         python_exe = os.path.join(sys.base_prefix, "python.exe")
         if not os.path.isfile(python_exe):
-            log(obs.LOG_ERROR,
+            log("ERROR",
                 f"Cannot auto-install {missing}: python.exe not found in "
                 f"{sys.base_prefix}. Install manually with: "
                 f"pip install --user {' '.join(missing)}")
             return False
 
-        log(obs.LOG_INFO,
+        log("INFO",
             f"Installing missing packages: {', '.join(missing)} "
             "(this can take a minute)...")
         try:
@@ -154,12 +182,12 @@ def ensure_dependencies():
                 capture_output=True, text=True, timeout=PIP_TIMEOUT_S,
                 creationflags=subprocess.CREATE_NO_WINDOW)
         except (OSError, subprocess.TimeoutExpired) as e:
-            log(obs.LOG_ERROR, f"Could not run pip install: {e}")
+            log("ERROR", f"Could not run pip install: {e}")
             return False
         if result.returncode != 0:
             tail = (result.stderr or result.stdout
                     or "").strip().splitlines()[-5:]
-            log(obs.LOG_ERROR, "pip install failed:\n" + "\n".join(tail))
+            log("ERROR", "pip install failed:\n" + "\n".join(tail))
             return False
 
         # A fresh --user install may land in a directory that was not on
@@ -168,7 +196,7 @@ def ensure_dependencies():
         if user_site not in sys.path:
             sys.path.insert(0, user_site)
         importlib.invalidate_caches()
-        log(obs.LOG_INFO, f"Installed {', '.join(missing)}")
+        log("INFO", f"Installed {', '.join(missing)}")
         return True
 
 
@@ -180,22 +208,22 @@ def find_index_by_name():
 
         devices = FilterGraph().get_input_devices()
     except ImportError:
-        log(obs.LOG_WARNING,
+        log("WARNING",
             "pygrabber not installed, falling back to probing indices "
             "by resolution (pip install pygrabber)")
         return -1
     except OSError as e:
-        log(obs.LOG_WARNING,
+        log("WARNING",
             f"pygrabber device enumeration failed ({e}), falling back "
             "to probing indices by resolution")
         return -1
 
     for i, name in enumerate(devices):
         if "OBS Virtual Camera" in name:
-            log(obs.LOG_INFO,
+            log("INFO",
                 f"Found '{name}' at cv2 index {i} (by device name)")
             return i
-    log(obs.LOG_WARNING, f"OBS Virtual Camera not in device list: {devices}")
+    log("WARNING", f"OBS Virtual Camera not in device list: {devices}")
     return -1
 
 
@@ -205,7 +233,7 @@ def find_index_by_resolution():
     try:
         import cv2
     except ImportError:
-        log(obs.LOG_ERROR,
+        log("ERROR",
             "opencv-python is not installed in OBS's Python "
             "(pip install opencv-python)")
         return -1
@@ -223,7 +251,7 @@ def find_index_by_resolution():
                 int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
         cap.release()
         if size == target:
-            log(obs.LOG_INFO,
+            log("INFO",
                 f"Found virtual camera at cv2 index {i} "
                 f"(matched output resolution {target[0]}x{target[1]})")
             return i
@@ -255,7 +283,7 @@ def detection_worker():
 
     camera_index = index
     if index < 0:
-        log(obs.LOG_ERROR, "Could not find the OBS Virtual Camera index")
+        log("ERROR", "Could not find the OBS Virtual Camera index")
 
 
 def start_detection():
@@ -274,7 +302,7 @@ def startup_tick():
         start_attempts += 1
         if start_attempts > MAX_START_ATTEMPTS:
             obs.timer_remove(startup_tick)
-            log(obs.LOG_ERROR,
+            log("ERROR",
                 "Giving up: virtual camera did not start after "
                 f"{MAX_START_ATTEMPTS} attempts")
             return
@@ -283,7 +311,7 @@ def startup_tick():
         return  # verify it is active on the next tick
 
     obs.timer_remove(startup_tick)
-    log(obs.LOG_INFO, "Virtual camera is active")
+    log("INFO", "Virtual camera is active")
     start_detection()
 
 
@@ -304,14 +332,14 @@ def livesplit_send(command):
     with livesplit_lock:
         conn = livesplit_conn
     if conn is None:
-        log(obs.LOG_WARNING,
+        log("WARNING",
             f"Not connected to LiveSplit, dropped command '{command}'")
         return False
     try:
         conn.send(command)
         return True
     except Exception as e:
-        log(obs.LOG_WARNING, f"Sending '{command}' to LiveSplit failed: {e}")
+        log("WARNING", f"Sending '{command}' to LiveSplit failed: {e}")
         return False
 
 
@@ -328,7 +356,7 @@ def livesplit_worker(url, stop):
     try:
         import websocket
     except ImportError:
-        log(obs.LOG_ERROR,
+        log("ERROR",
             "websocket-client is not installed in OBS's Python "
             "(pip install --user websocket-client)")
         return
@@ -340,7 +368,7 @@ def livesplit_worker(url, stop):
                 url, timeout=LIVESPLIT_CONNECT_TIMEOUT_S)
         except Exception as e:
             if not failure_logged:
-                log(obs.LOG_WARNING,
+                log("WARNING",
                     f"Cannot reach LiveSplit at {url} ({e}). Make sure the "
                     "WS server is running: right click LiveSplit -> Control "
                     "-> Start WS Server. Retrying every "
@@ -353,7 +381,7 @@ def livesplit_worker(url, stop):
         conn.settimeout(LIVESPLIT_RECV_TIMEOUT_S)
         with livesplit_lock:
             livesplit_conn = conn
-        log(obs.LOG_INFO, f"Connected to LiveSplit at {url}")
+        log("INFO", f"Connected to LiveSplit at {url}")
 
         try:
             while not stop.is_set():
@@ -362,7 +390,7 @@ def livesplit_worker(url, stop):
                 except websocket.WebSocketTimeoutException:
                     continue
                 if msg:
-                    log(obs.LOG_INFO, f"LiveSplit: {msg}")
+                    log("INFO", f"LiveSplit: {msg}")
                 elif not conn.connected:  # server sent a close frame
                     break
         except Exception:
@@ -376,7 +404,7 @@ def livesplit_worker(url, stop):
             except Exception:
                 pass
         if not stop.is_set():
-            log(obs.LOG_WARNING, "LiveSplit connection lost, reconnecting...")
+            log("WARNING", "LiveSplit connection lost, reconnecting...")
 
 
 def close_livesplit_conn():
@@ -406,7 +434,7 @@ def restart_livesplit_worker():
 
 def test_livesplit_clicked(props, prop):
     if livesplit_send("getcurrenttimerphase"):
-        log(obs.LOG_INFO,
+        log("INFO",
             "Sent 'getcurrenttimerphase'; the response appears in this log")
     return False
 
@@ -439,7 +467,7 @@ def github_contents(path):
         with urllib.request.urlopen(url, timeout=GITHUB_TIMEOUT_S) as resp:
             data = json.load(resp)
     except (urllib.error.URLError, OSError, ValueError) as e:
-        log(obs.LOG_WARNING, f"Could not list GitHub path '{path}' ({e})")
+        log("WARNING", f"Could not list GitHub path '{path}' ({e})")
         data = []
     entries = data if isinstance(data, list) else []
     _github_contents_cache[path] = (now, entries)
@@ -491,14 +519,14 @@ def github_download_file(remote_path, local_path):
         with urllib.request.urlopen(url, timeout=GITHUB_TIMEOUT_S) as resp:
             data = resp.read()
     except (urllib.error.URLError, OSError) as e:
-        log(obs.LOG_WARNING, f"Could not download '{remote_path}' from GitHub ({e})")
+        log("WARNING", f"Could not download '{remote_path}' from GitHub ({e})")
         return False
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     try:
         with open(local_path, "wb") as f:
             f.write(data)
     except OSError as e:
-        log(obs.LOG_WARNING, f"Could not save '{local_path}' ({e})")
+        log("WARNING", f"Could not save '{local_path}' ({e})")
         return False
     return True
 
@@ -519,16 +547,16 @@ def download_category_worker(game, category):
                                   os.path.join(local_base, "images", name)) and ok
 
     if ok:
-        log(obs.LOG_INFO, f"Downloaded '{game}/{category}' from GitHub")
+        log("INFO", f"Downloaded '{game}/{category}' from GitHub")
     else:
-        log(obs.LOG_WARNING,
+        log("WARNING",
             f"'{game}/{category}' download from GitHub finished with errors")
 
 
 def download_category_if_missing(game, category):
     if not game or not category or category_exists_locally(game, category):
         return
-    log(obs.LOG_INFO, f"'{game}/{category}' not found locally, downloading from GitHub...")
+    log("INFO", f"'{game}/{category}' not found locally, downloading from GitHub...")
     threading.Thread(target=download_category_worker, args=(game, category),
                      daemon=True).start()
 
@@ -581,19 +609,21 @@ def crop_roi(frame, roi):
     return frame[y0:y1, x0:x1]
 
 
-def frame_matches(frame, template, roi=None):
+def match_score(frame, template, roi=None):
+    """Best matchTemplate score of `template` in `frame` (or within `roi`
+    if given), or None if the search area is too small for the template."""
     import cv2
 
     if roi is not None:
         frame = crop_roi(frame, roi)
         if frame is None:
-            return False
+            return None
     th, tw = template.shape[:2]
     fh, fw = frame.shape[:2]
     if th > fh or tw > fw:
-        return False
+        return None
     result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
-    return bool(result.max() >= MATCH_THRESHOLD)
+    return float(result.max())
 
 
 def validate_roi(label, roi):
@@ -636,24 +666,131 @@ def load_splits(category_dir):
         return json.load(f)
 
 
-def autosplit_worker(game, category, stop):
+def standalone_connect_livesplit(url):
+    """Connects to the LiveSplit WS server, retrying until it succeeds."""
+    import websocket
+
+    failure_logged = False
+    while True:
+        try:
+            return websocket.create_connection(
+                url, timeout=LIVESPLIT_CONNECT_TIMEOUT_S)
+        except Exception as e:
+            if not failure_logged:
+                log("WARNING",
+                    f"Cannot reach LiveSplit at {url} ({e}). Make sure the "
+                    "WS server is running: right click LiveSplit -> Control "
+                    f"-> Start WS Server. Retrying every {LIVESPLIT_RETRY_S}s...")
+                failure_logged = True
+            time.sleep(LIVESPLIT_RETRY_S)
+
+
+def send_livesplit_command(url, command):
+    """Opens a fresh connection, sends `command`, and closes it.
+
+    Splits in a single run can be many minutes apart, and a WebSocket left
+    open and idle for that long can go stale without either side noticing
+    (send() on a half-dead connection can return successfully even though
+    the server never receives it, since nothing here calls recv() to
+    detect a server-side close). A short-lived connection per command
+    sidesteps that entirely.
+    """
+    conn = standalone_connect_livesplit(url)
+    try:
+        conn.send(command)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def disable_process_power_throttling():
+    """Opts this process out of Windows' Efficiency Mode / EcoQoS power
+    throttling.
+
+    Windows can silently throttle CPU scheduling for background processes
+    with no visible window and no recent input — exactly how the
+    --autosplit subprocess runs (spawned with CREATE_NO_WINDOW) — which
+    can make camera reads lag behind the live feed by whole seconds even
+    though nothing in this file's own code is slow.
+    """
+    class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+        _fields_ = [
+            ("Version", ctypes.c_uint32),
+            ("ControlMask", ctypes.c_uint32),
+            ("StateMask", ctypes.c_uint32),
+        ]
+
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+    ProcessPowerThrottling = 4  # PROCESS_INFORMATION_CLASS enum value
+
+    state = PROCESS_POWER_THROTTLING_STATE(
+        Version=1,
+        ControlMask=PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask=0)  # 0 = do not throttle
+    try:
+        ctypes.windll.kernel32.SetProcessInformation(
+            ctypes.windll.kernel32.GetCurrentProcess(),
+            ProcessPowerThrottling,
+            ctypes.byref(state), ctypes.sizeof(state))
+    except (OSError, AttributeError):
+        pass  # best-effort; not available on older Windows versions
+
+
+class LatestFrame:
+    """Holds only the most recently grabbed camera frame.
+
+    Written by frame_grabber_loop (on its own thread) and read by the
+    matching loop, so matching always sees the newest frame instead of
+    one still sitting behind a backlog in cv2's own internal buffering.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._ok = False
+        self._frame = None
+
+    def set(self, ok, frame):
+        with self._lock:
+            self._ok = ok
+            self._frame = frame
+
+    def get(self):
+        with self._lock:
+            return self._ok, self._frame
+
+
+def frame_grabber_loop(cap, latest, stop):
+    """Reads the camera as fast as it supplies frames, discarding any
+    backlog by only ever keeping the newest one for the matching loop."""
+    while not stop.is_set():
+        ok, frame = cap.read()
+        latest.set(ok, frame)
+        if not ok:
+            time.sleep(FRAME_POLL_INTERVAL_S)
+
+
+def standalone_autosplit_main(game, category, livesplit_url):
     """Matches the camera feed against splits.json and drives LiveSplit.
 
-    Waits for the camera index and the category's local files (which may
-    still be downloading from GitHub) to become available, then walks the
-    splits in order ('start', numeric keys ascending, 'stop'). Within a
-    split, its images must match in the given order before the split's
-    delay starts; only then is the LiveSplit command sent and the next
-    split becomes active. 'start' sends 'starttimer'; every other split
-    (including 'stop', which ends the run) sends 'split'.
+    Runs as its own OS process (spawned by restart_autosplit_process),
+    since cv2.VideoCapture(CAP_DSHOW) only gets real frames from the OBS
+    Virtual Camera when opened outside OBS's own process.
+
+    Waits for the category's local files (which may still be downloading
+    from GitHub) to become available, then walks the splits in order
+    ('start', numeric keys ascending, 'stop'). Within a split, its images
+    must match in the given order before the split's delay starts; only
+    then is the LiveSplit command sent and the next split becomes active.
+    'start' sends 'starttimer'; every other split (including 'stop', which
+    ends the run) sends 'split'.
     """
     category_dir = os.path.join(GAMES_DIR, game, category)
     splits_path = os.path.join(category_dir, SPLITS_FILENAME)
 
-    while not stop.is_set() and (camera_index < 0 or not os.path.isfile(splits_path)):
-        stop.wait(AUTOSPLIT_WAIT_S)
-    if stop.is_set():
-        return
+    while not os.path.isfile(splits_path):
+        time.sleep(AUTOSPLIT_WAIT_S)
 
     try:
         splits = load_splits(category_dir)
@@ -666,29 +803,68 @@ def autosplit_worker(game, category, stop):
                               for name, _ in parsed]
             rois[key] = [roi for _, roi in parsed]
     except (OSError, ValueError, KeyError) as e:
-        log(obs.LOG_ERROR, f"Could not load splits for '{game}/{category}': {e}")
+        log("ERROR", f"Could not load splits for '{game}/{category}': {e}")
+        return
+
+    camera_index = find_index_by_name()
+    if camera_index < 0:
+        log("ERROR", "Could not find the OBS Virtual Camera index")
         return
 
     import cv2
 
     cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        log(obs.LOG_ERROR, "Autosplitter: could not open the camera for template matching")
+        log("ERROR", "Could not open the camera for template matching")
         return
+    # Without this, cv2 can queue up several frames internally and read()
+    # keeps returning the oldest one once the queue is full, making
+    # matches (and therefore splits) lag behind the live feed.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    log(obs.LOG_INFO, f"Autosplitter armed for '{game}/{category}': {' -> '.join(keys)}")
+    # Verify LiveSplit is reachable before arming (fails fast with a clear
+    # log line if it's not); each actual split is then sent over its own
+    # short-lived connection (see send_livesplit_command).
+    standalone_connect_livesplit(livesplit_url).close()
+    log("INFO", f"Connected to LiveSplit at {livesplit_url}")
+    log("INFO", f"Autosplitter armed for '{game}/{category}': {' -> '.join(keys)}")
+
+    latest_frame = LatestFrame()
+    stop_grabbing = threading.Event()
+    grabber_thread = threading.Thread(
+        target=frame_grabber_loop, args=(cap, latest_frame, stop_grabbing),
+        daemon=True)
+    grabber_thread.start()
+
     key_index = 0
     image_index = 0
+    read_failure_logged = False
+    last_score_log = 0.0
     try:
-        while not stop.is_set() and key_index < len(keys):
-            ok, frame = cap.read()
-            if not ok:
-                stop.wait(FRAME_POLL_INTERVAL_S)
+        while key_index < len(keys):
+            ok, frame = latest_frame.get()
+            if not ok or frame is None:
+                if not read_failure_logged:
+                    log("WARNING",
+                        "Camera read failed (no frames from the virtual "
+                        "camera); will keep retrying")
+                    read_failure_logged = True
+                time.sleep(FRAME_POLL_INTERVAL_S)
                 continue
+            read_failure_logged = False
 
             key = keys[key_index]
-            if not frame_matches(frame, templates[key][image_index], rois[key][image_index]):
-                stop.wait(FRAME_POLL_INTERVAL_S)
+            score = match_score(frame, templates[key][image_index], rois[key][image_index])
+            if score is None or score < MATCH_THRESHOLD:
+                now = time.monotonic()
+                if now - last_score_log >= SCORE_LOG_INTERVAL_S:
+                    name, _ = parse_image_entry(key, splits[key]["images"][image_index])
+                    shown = "n/a (roi outside frame)" if score is None else f"{score:.3f}"
+                    log("INFO",
+                        f"Waiting on '{key}' image '{name}', "
+                        f"score={shown} (need {MATCH_THRESHOLD})")
+                    last_score_log = now
+                time.sleep(FRAME_POLL_INTERVAL_S)
                 continue
 
             image_index += 1
@@ -696,38 +872,89 @@ def autosplit_worker(game, category, stop):
                 continue  # this split's next image may already be on screen
 
             delay_s = splits[key].get("delay", 0) / 1000
-            log(obs.LOG_INFO, f"Autosplitter: '{key}' detected, "
-                              f"acting in {delay_s:.1f}s")
-            stop.wait(delay_s)
-            if stop.is_set():
-                break
-            livesplit_send("starttimer" if key == "start" else "split")
+            log("INFO", f"'{key}' detected, acting in {delay_s:.1f}s")
+            time.sleep(delay_s)
+
+            command = "starttimer" if key == "start" else "split"
+            try:
+                send_livesplit_command(livesplit_url, command)
+            except Exception as e:
+                log("ERROR", f"Could not send '{command}' to LiveSplit: {e}")
 
             key_index += 1
             image_index = 0
     finally:
+        stop_grabbing.set()
+        grabber_thread.join(timeout=2)
         cap.release()
 
     if key_index >= len(keys):
-        log(obs.LOG_INFO, f"Autosplitter finished '{game}/{category}'")
+        log("INFO", f"Autosplitter finished '{game}/{category}'")
 
 
-def restart_autosplit_worker(game, category):
-    """Starts the autosplit worker for `game`/`category`, stopping any prior one."""
-    global autosplit_thread, autosplit_stop
+def read_autosplit_output(process):
+    """Relays the --autosplit subprocess's stdout into the OBS script log,
+    restoring the level each line was printed with (see log())."""
+    for line in process.stdout:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        level, sep, msg = line.partition(": ")
+        if sep and level == "ERROR":
+            log("ERROR", msg)
+        elif sep and level == "WARNING":
+            log("WARNING", msg)
+        elif sep and level == "INFO":
+            log("INFO", msg)
+        else:
+            log("INFO", line)
 
-    if autosplit_stop is not None:
-        autosplit_stop.set()
+
+def stop_autosplit_process():
+    global autosplit_process
+    if autosplit_process is None:
+        return
+    try:
+        autosplit_process.terminate()
+        autosplit_process.wait(timeout=5)
+    except Exception:
+        try:
+            autosplit_process.kill()
+        except Exception:
+            pass
+    autosplit_process = None
+
+
+def restart_autosplit_process(game, category):
+    """Spawns the --autosplit subprocess for `game`/`category`, stopping any
+    prior one first."""
+    global autosplit_process, autosplit_reader_thread
+
+    stop_autosplit_process()
 
     if not game or not category:
-        autosplit_thread = None
-        autosplit_stop = None
+        autosplit_reader_thread = None
         return
 
-    autosplit_stop = threading.Event()
-    autosplit_thread = threading.Thread(
-        target=autosplit_worker, args=(game, category, autosplit_stop), daemon=True)
-    autosplit_thread.start()
+    python_exe = os.path.join(sys.base_prefix, "python.exe")
+    if not os.path.isfile(python_exe):
+        log("ERROR",
+            f"Cannot start autosplitter: python.exe not found in {sys.base_prefix}")
+        return
+
+    autosplit_process = subprocess.Popen(
+        [python_exe, SCRIPT_PATH, "--autosplit", game, category, livesplit_url],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8",
+        # ABOVE_NORMAL, plus disable_process_power_throttling() on the
+        # subprocess side: a windowless background process is prone to
+        # Windows deprioritizing its scheduling, which showed up as
+        # camera reads lagging seconds behind the live feed.
+        creationflags=subprocess.CREATE_NO_WINDOW
+                     | subprocess.ABOVE_NORMAL_PRIORITY_CLASS)
+    autosplit_reader_thread = threading.Thread(
+        target=read_autosplit_output, args=(autosplit_process,), daemon=True)
+    autosplit_reader_thread.start()
 
 
 # --- OBS script entry points -------------------------------------------------
@@ -753,18 +980,30 @@ def script_update(settings):
     global livesplit_url, current_settings, autosplit_game, autosplit_category
     current_settings = settings
 
-    host = obs.obs_data_get_string(settings, "livesplit_host").strip()
+    host = obs.obs_data_get_string(settings, "livesplit_host").strip() or "localhost"
+    if host.lower() == "localhost":
+        # On Windows, connecting to "localhost" tries IPv6 (::1) first and
+        # only falls back to IPv4 after a ~2s timeout when nothing answers
+        # there, since LiveSplit's WS server only listens on IPv4. That 2s
+        # was landing on every single split once each one got its own
+        # short-lived connection (see send_livesplit_command).
+        host = "127.0.0.1"
     port = obs.obs_data_get_int(settings, "livesplit_port")
-    url = f"ws://{host or 'localhost'}:{port or 16834}/livesplit"
-    if url != livesplit_url:
+    url = f"ws://{host}:{port or 16834}/livesplit"
+    url_changed = url != livesplit_url
+    if url_changed:
         livesplit_url = url
         restart_livesplit_worker()
 
     game = obs.obs_data_get_string(settings, "game")
     category = obs.obs_data_get_string(settings, "category")
-    if (game, category) != (autosplit_game, autosplit_category):
+    category_changed = (game, category) != (autosplit_game, autosplit_category)
+    if category_changed:
         autosplit_game, autosplit_category = game, category
-        restart_autosplit_worker(game, category)
+    # A LiveSplit URL change also needs to reach an already-armed
+    # subprocess, which connected to LiveSplit itself at spawn time.
+    if category_changed or url_changed:
+        restart_autosplit_process(game, category)
 
 
 def script_load(settings):
@@ -782,8 +1021,7 @@ def script_unload():
     global unloading
     unloading = True
     obs.timer_remove(startup_tick)
-    if autosplit_stop is not None:
-        autosplit_stop.set()
+    stop_autosplit_process()
     if livesplit_stop is not None:
         livesplit_stop.set()
     close_livesplit_conn()
@@ -817,3 +1055,23 @@ def script_properties():
                                   "Test LiveSplit connection",
                                   test_livesplit_clicked)
     return props
+
+
+# --- Standalone entry point --------------------------------------------------
+# Reached only when OBS's autosplit process runs this same file as
+# `python.exe script.py --autosplit <game> <category> <livesplit_url>`;
+# never when OBS imports it as a script module.
+if __name__ == "__main__":
+    # Redirected to a pipe, stdout/stderr would otherwise default to the
+    # system codepage (e.g. cp1252) instead of UTF-8, which read_autosplit_
+    # output() in the parent process expects (game/category names may
+    # contain non-ASCII characters, e.g. accented ones).
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    disable_process_power_throttling()
+    if len(sys.argv) == 5 and sys.argv[1] == "--autosplit":
+        standalone_autosplit_main(sys.argv[2], sys.argv[3], sys.argv[4])
+    else:
+        print("usage: script.py --autosplit <game> <category> <livesplit_url>",
+              file=sys.stderr)
+        sys.exit(1)
