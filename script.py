@@ -45,6 +45,22 @@ LIVESPLIT_RECV_TIMEOUT_S = 1
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 GAMES_DIR = os.path.join(SCRIPT_DIR, "games")
+SPLITS_FILENAME = "splits.json"
+
+# cv2.matchTemplate (TM_CCOEFF_NORMED) score above which a template counts
+# as detected in the current frame; tune per game if splits misfire.
+MATCH_THRESHOLD = 0.9
+# An "images" list entry in splits.json may be either a filename (matched
+# against the full frame) or {filename: [x, y, w, h]} (pixels, in the
+# camera frame's own coordinate space) to restrict matchTemplate to that
+# rect for just that image. Narrows the search space (faster) and ignores
+# unrelated on-screen changes (fewer false positives).
+# How often the autosplitter re-reads the camera while a split's images
+# haven't matched yet.
+FRAME_POLL_INTERVAL_S = 0.1
+# How often the autosplitter checks whether the camera index / the
+# selected category's local files have become available.
+AUTOSPLIT_WAIT_S = 1
 
 # Games bundled in the script's own repo are also offered even when not
 # downloaded yet; picking one fetches it into GAMES_DIR for local/offline use.
@@ -80,6 +96,13 @@ livesplit_conn = None  # connected WebSocket, guarded by livesplit_lock
 
 # path (relative to the repo root) -> (fetched_at, GitHub API 'contents' entries)
 _github_contents_cache = {}
+
+# game/category currently armed in the autosplit worker (script_update
+# restarts the worker when these no longer match the settings).
+autosplit_game = ""
+autosplit_category = ""
+autosplit_thread = None
+autosplit_stop = None
 
 # Settings from the last script_load()/script_update(), kept so
 # script_properties() can populate the category list for the game that is
@@ -481,7 +504,7 @@ def github_download_file(remote_path, local_path):
 
 
 def download_category_worker(game, category):
-    """Fetches one category's split.json + images from GitHub into GAMES_DIR.
+    """Fetches one category's splits.json + images from GitHub into GAMES_DIR.
 
     Runs on its own thread so the properties dialog doesn't block on
     network I/O; afterwards the category is a normal local one.
@@ -489,8 +512,8 @@ def download_category_worker(game, category):
     remote_base = f"games/{game}/{category}"
     local_base = os.path.join(GAMES_DIR, game, category)
 
-    ok = github_download_file(f"{remote_base}/split.json",
-                              os.path.join(local_base, "split.json"))
+    ok = github_download_file(f"{remote_base}/{SPLITS_FILENAME}",
+                              os.path.join(local_base, SPLITS_FILENAME))
     for name in github_list_filenames(f"{remote_base}/images"):
         ok = github_download_file(f"{remote_base}/images/{name}",
                                   os.path.join(local_base, "images", name)) and ok
@@ -525,6 +548,188 @@ def game_changed(props, prop, settings):
     return True
 
 
+# --- Autosplitting (image matching) ------------------------------------------
+
+def load_template(path):
+    """Reads an image file as a cv2 (BGR) array.
+
+    cv2.imread() silently fails on Windows for paths containing
+    non-ASCII characters (e.g. accented game names), so the file is read
+    as bytes and decoded instead.
+    """
+    import cv2
+    import numpy as np
+
+    data = np.fromfile(path, dtype=np.uint8)
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Could not decode image: {path}")
+    return image
+
+
+def crop_roi(frame, roi):
+    """Crops `frame` to `roi` = [x, y, w, h], clipped to the frame bounds.
+
+    Returns None if the clipped rect is empty (roi fully outside the frame).
+    """
+    fh, fw = frame.shape[:2]
+    x, y, w, h = roi
+    x0, y0 = max(0, min(x, fw)), max(0, min(y, fh))
+    x1, y1 = max(0, min(x + w, fw)), max(0, min(y + h, fh))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return frame[y0:y1, x0:x1]
+
+
+def frame_matches(frame, template, roi=None):
+    import cv2
+
+    if roi is not None:
+        frame = crop_roi(frame, roi)
+        if frame is None:
+            return False
+    th, tw = template.shape[:2]
+    fh, fw = frame.shape[:2]
+    if th > fh or tw > fw:
+        return False
+    result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
+    return bool(result.max() >= MATCH_THRESHOLD)
+
+
+def validate_roi(label, roi):
+    if (not isinstance(roi, (list, tuple)) or len(roi) != 4
+            or not all(isinstance(n, int) for n in roi)):
+        raise ValueError(
+            f"'{label}' has an invalid roi (expected [x, y, w, h] ints): {roi!r}")
+
+
+def parse_image_entry(key, entry):
+    """One "images" list entry for split `key`: either a filename (matched
+    against the full frame) or {filename: [x, y, w, h]} restricting
+    matchTemplate to that rect just for this image.
+
+    Returns (filename, roi_or_None).
+    """
+    if isinstance(entry, str):
+        return entry, None
+    if isinstance(entry, dict) and len(entry) == 1:
+        (name, roi), = entry.items()
+        validate_roi(f"{key}: {name}", roi)
+        return name, roi
+    raise ValueError(f"'{key}' has an invalid images entry: {entry!r}")
+
+
+def ordered_split_keys(splits):
+    """['start', then numeric keys ascending, then 'stop']."""
+    def sort_key(key):
+        if key == "start":
+            return (0, 0)
+        if key == "stop":
+            return (2, 0)
+        return (1, int(key))
+    return sorted(splits.keys(), key=sort_key)
+
+
+def load_splits(category_dir):
+    path = os.path.join(category_dir, SPLITS_FILENAME)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def autosplit_worker(game, category, stop):
+    """Matches the camera feed against splits.json and drives LiveSplit.
+
+    Waits for the camera index and the category's local files (which may
+    still be downloading from GitHub) to become available, then walks the
+    splits in order ('start', numeric keys ascending, 'stop'). Within a
+    split, its images must match in the given order before the split's
+    delay starts; only then is the LiveSplit command sent and the next
+    split becomes active. 'start' sends 'starttimer'; every other split
+    (including 'stop', which ends the run) sends 'split'.
+    """
+    category_dir = os.path.join(GAMES_DIR, game, category)
+    splits_path = os.path.join(category_dir, SPLITS_FILENAME)
+
+    while not stop.is_set() and (camera_index < 0 or not os.path.isfile(splits_path)):
+        stop.wait(AUTOSPLIT_WAIT_S)
+    if stop.is_set():
+        return
+
+    try:
+        splits = load_splits(category_dir)
+        keys = ordered_split_keys(splits)
+        templates = {}
+        rois = {}
+        for key in keys:
+            parsed = [parse_image_entry(key, entry) for entry in splits[key]["images"]]
+            templates[key] = [load_template(os.path.join(category_dir, "images", name))
+                              for name, _ in parsed]
+            rois[key] = [roi for _, roi in parsed]
+    except (OSError, ValueError, KeyError) as e:
+        log(obs.LOG_ERROR, f"Could not load splits for '{game}/{category}': {e}")
+        return
+
+    import cv2
+
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        log(obs.LOG_ERROR, "Autosplitter: could not open the camera for template matching")
+        return
+
+    log(obs.LOG_INFO, f"Autosplitter armed for '{game}/{category}': {' -> '.join(keys)}")
+    key_index = 0
+    image_index = 0
+    try:
+        while not stop.is_set() and key_index < len(keys):
+            ok, frame = cap.read()
+            if not ok:
+                stop.wait(FRAME_POLL_INTERVAL_S)
+                continue
+
+            key = keys[key_index]
+            if not frame_matches(frame, templates[key][image_index], rois[key][image_index]):
+                stop.wait(FRAME_POLL_INTERVAL_S)
+                continue
+
+            image_index += 1
+            if image_index < len(templates[key]):
+                continue  # this split's next image may already be on screen
+
+            delay_s = splits[key].get("delay", 0) / 1000
+            log(obs.LOG_INFO, f"Autosplitter: '{key}' detected, "
+                              f"acting in {delay_s:.1f}s")
+            stop.wait(delay_s)
+            if stop.is_set():
+                break
+            livesplit_send("starttimer" if key == "start" else "split")
+
+            key_index += 1
+            image_index = 0
+    finally:
+        cap.release()
+
+    if key_index >= len(keys):
+        log(obs.LOG_INFO, f"Autosplitter finished '{game}/{category}'")
+
+
+def restart_autosplit_worker(game, category):
+    """Starts the autosplit worker for `game`/`category`, stopping any prior one."""
+    global autosplit_thread, autosplit_stop
+
+    if autosplit_stop is not None:
+        autosplit_stop.set()
+
+    if not game or not category:
+        autosplit_thread = None
+        autosplit_stop = None
+        return
+
+    autosplit_stop = threading.Event()
+    autosplit_thread = threading.Thread(
+        target=autosplit_worker, args=(game, category, autosplit_stop), daemon=True)
+    autosplit_thread.start()
+
+
 # --- OBS script entry points -------------------------------------------------
 
 def script_description():
@@ -545,7 +750,7 @@ def script_defaults(settings):
 
 
 def script_update(settings):
-    global livesplit_url, current_settings
+    global livesplit_url, current_settings, autosplit_game, autosplit_category
     current_settings = settings
 
     host = obs.obs_data_get_string(settings, "livesplit_host").strip()
@@ -554,6 +759,12 @@ def script_update(settings):
     if url != livesplit_url:
         livesplit_url = url
         restart_livesplit_worker()
+
+    game = obs.obs_data_get_string(settings, "game")
+    category = obs.obs_data_get_string(settings, "category")
+    if (game, category) != (autosplit_game, autosplit_category):
+        autosplit_game, autosplit_category = game, category
+        restart_autosplit_worker(game, category)
 
 
 def script_load(settings):
@@ -571,6 +782,8 @@ def script_unload():
     global unloading
     unloading = True
     obs.timer_remove(startup_tick)
+    if autosplit_stop is not None:
+        autosplit_stop.set()
     if livesplit_stop is not None:
         livesplit_stop.set()
     close_livesplit_conn()
