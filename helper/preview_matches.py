@@ -8,32 +8,37 @@ installed by script.py are available:
 Opens a window over the camera feed listing every image referenced by
 that category's splits.json, grouped by split key in the order script.py
 processes them ('start', numeric keys ascending, 'stop'), each with its
-live matchTemplate score. Green means the image currently scores at or
-above the match threshold (i.e. script.py would count it as detected
-right now); red means it doesn't. Use --threshold to try a different
-cutoff than script.py's default without editing any code.
+live match score. Green means the image currently scores at or above the
+match threshold (i.e. script.py would count it as detected right now);
+red means it doesn't. Use --threshold to try a different cutoff than
+script.py's default without editing any code.
+
+Template loading and scoring (including masked matching for images with
+real PNG transparency) are imported directly from script.py rather than
+reimplemented here, so this preview can't silently drift out of sync with
+what script.py actually does when matching splits.
 
 Keys in the preview window:
     ESC / q   quit
 """
 
 import argparse
-import json
 import os
 import sys
 
+# script.py lives at the repo root, one level up from this helper.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+import script
+
 try:
     import cv2
-    import numpy as np
 except ImportError:
     sys.exit("opencv-python is not installed for this interpreter. "
              "Install it with:\n"
              f"    {sys.executable} -m pip install --user opencv-python")
 
-GAMES_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "games")
-SPLITS_FILENAME = "splits.json"
-DEFAULT_THRESHOLD = 0.9  # keep in sync with script.py's MATCH_THRESHOLD
 WINDOW = "matchTemplate preview  |  Q/ESC: quit"
 WINDOW_SIZE = (1280, 720)
 LINE_HEIGHT = 22
@@ -62,102 +67,25 @@ def find_camera_index():
     return -1
 
 
-def load_template(path):
-    """Reads an image file as a cv2 (BGR) array.
-
-    cv2.imread() silently fails on Windows for paths containing
-    non-ASCII characters (e.g. accented game names), so the file is
-    read as bytes and decoded instead.
-    """
-    data = np.fromfile(path, dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError(f"Could not decode image: {path}")
-    return image
-
-
-def ordered_split_keys(splits):
-    """['start', then numeric keys ascending, then 'stop']; same order
-    script.py's autosplit_worker processes them in."""
-    def sort_key(key):
-        if key == "start":
-            return (0, 0)
-        if key == "stop":
-            return (2, 0)
-        return (1, int(key))
-    return sorted(splits.keys(), key=sort_key)
-
-
-def validate_roi(label, roi):
-    if (not isinstance(roi, (list, tuple)) or len(roi) != 4
-            or not all(isinstance(n, int) for n in roi)):
-        raise ValueError(
-            f"'{label}' has an invalid roi (expected [x, y, w, h] ints): {roi!r}")
-
-
-def parse_image_entry(key, entry):
-    """One "images" list entry for split `key`: either a filename (matched
-    against the full frame) or {filename: [x, y, w, h]} restricting
-    matchTemplate to that rect just for this image; same format script.py
-    reads. Returns (filename, roi_or_None)."""
-    if isinstance(entry, str):
-        return entry, None
-    if isinstance(entry, dict) and len(entry) == 1:
-        (name, roi), = entry.items()
-        validate_roi(f"{key}: {name}", roi)
-        return name, roi
-    raise ValueError(f"'{key}' has an invalid images entry: {entry!r}")
-
-
 def load_entries(category_dir):
     """[(label, template, roi), ...] for every image in splits.json, in
     split order. `roi` is None for images matched against the full frame."""
-    path = os.path.join(category_dir, SPLITS_FILENAME)
-    with open(path, "r", encoding="utf-8") as f:
-        splits = json.load(f)
+    splits = script.load_splits(category_dir)
 
     entries = []
-    for key in ordered_split_keys(splits):
+    for key in script.ordered_split_keys(splits):
         for entry in splits[key]["images"]:
-            name, roi = parse_image_entry(key, entry)
-            template = load_template(os.path.join(category_dir, "images", name))
+            name, roi = script.parse_image_entry(key, entry)
+            template = script.prepare_template(
+                *script.load_template(os.path.join(category_dir, "images", name)))
             entries.append((f"[{key}] {name}", template, roi))
     return entries
-
-
-def crop_roi(frame, roi):
-    """Crops `frame` to `roi` = [x, y, w, h], clipped to the frame bounds.
-
-    Returns None if the clipped rect is empty (roi fully outside the frame).
-    """
-    fh, fw = frame.shape[:2]
-    x, y, w, h = roi
-    x0, y0 = max(0, min(x, fw)), max(0, min(y, fh))
-    x1, y1 = max(0, min(x + w, fw)), max(0, min(y + h, fh))
-    if x1 <= x0 or y1 <= y0:
-        return None
-    return frame[y0:y1, x0:x1]
-
-
-def score(frame, template, roi=None):
-    """Best matchTemplate score of `template` in `frame` (or within `roi`
-    if given), or None if the search area is too small for the template."""
-    if roi is not None:
-        frame = crop_roi(frame, roi)
-        if frame is None:
-            return None
-    th, tw = template.shape[:2]
-    fh, fw = frame.shape[:2]
-    if th > fh or tw > fw:
-        return None
-    result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
-    return float(result.max())
 
 
 def draw_overlay(frame, entries, threshold):
     # Scored against the clean frame, before the text list darkens the
     # top-left corner below, since some ROIs sit in that same corner.
-    scores = [score(frame, template, roi) for _, template, roi in entries]
+    scores = [script.match_score(frame, template, roi) for _, template, roi in entries]
 
     overlay = frame.copy()
     height = LINE_HEIGHT * len(entries) + 10
@@ -183,14 +111,14 @@ def draw_overlay(frame, entries, threshold):
 
 
 def list_games():
-    if not os.path.isdir(GAMES_DIR):
+    if not os.path.isdir(script.GAMES_DIR):
         return []
-    return sorted(n for n in os.listdir(GAMES_DIR)
-                  if os.path.isdir(os.path.join(GAMES_DIR, n)))
+    return sorted(n for n in os.listdir(script.GAMES_DIR)
+                  if os.path.isdir(os.path.join(script.GAMES_DIR, n)))
 
 
 def list_categories(game):
-    game_dir = os.path.join(GAMES_DIR, game)
+    game_dir = os.path.join(script.GAMES_DIR, game)
     if not os.path.isdir(game_dir):
         return []
     return sorted(n for n in os.listdir(game_dir)
@@ -205,11 +133,11 @@ def main():
     parser.add_argument("--index", type=int, default=None,
                        help="cv2 camera index (default: find the OBS Virtual "
                             "Camera by device name)")
-    parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
+    parser.add_argument("--threshold", type=float, default=script.MATCH_THRESHOLD,
                        help="match score to color green (default: %(default)s)")
     args = parser.parse_args()
 
-    category_dir = os.path.join(GAMES_DIR, args.game, args.category)
+    category_dir = os.path.join(script.GAMES_DIR, args.game, args.category)
     if not os.path.isdir(category_dir):
         games = list_games()
         categories = list_categories(args.game)
