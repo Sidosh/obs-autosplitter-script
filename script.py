@@ -55,6 +55,9 @@ LIVESPLIT_RETRY_S = 5
 LIVESPLIT_CONNECT_TIMEOUT_S = 5
 # recv() timeout; also how quickly the worker notices a stop request.
 LIVESPLIT_RECV_TIMEOUT_S = 1
+# How often the --autosplit subprocess polls LiveSplit's timer phase to
+# notice a reset it did not itself trigger (see livesplit_reset_watcher).
+RESET_POLL_INTERVAL_S = 1
 
 SCRIPT_PATH = os.path.abspath(__file__)
 SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
@@ -778,6 +781,42 @@ def send_livesplit_command(url, command):
             pass
 
 
+def livesplit_reset_watcher(url, reset_event, stop):
+    """Sets `reset_event` whenever LiveSplit's timer goes from Running/Paused
+    back to NotRunning, i.e. it was reset by something other than this
+    script (a hotkey, the LiveSplit UI, another tool).
+
+    The LiveSplit server only ever answers commands it is sent; it never
+    pushes phase changes on its own, so polling 'getcurrenttimerphase' is
+    the only way to notice such a reset. Runs on its own short-lived
+    connections, like send_livesplit_command, so a slow/unreachable server
+    can never stall the frame-matching loop this runs alongside.
+    """
+    import websocket
+
+    was_active = False
+    while not stop.is_set():
+        try:
+            conn = websocket.create_connection(
+                url, timeout=LIVESPLIT_CONNECT_TIMEOUT_S)
+            try:
+                conn.settimeout(LIVESPLIT_CONNECT_TIMEOUT_S)
+                conn.send("getcurrenttimerphase")
+                phase = conn.recv().strip()
+            finally:
+                conn.close()
+        except Exception:
+            stop.wait(RESET_POLL_INTERVAL_S)
+            continue
+
+        if phase in ("Running", "Paused"):
+            was_active = True
+        elif phase == "NotRunning" and was_active:
+            was_active = False
+            reset_event.set()
+        stop.wait(RESET_POLL_INTERVAL_S)
+
+
 def disable_process_power_throttling():
     """Opts this process out of Windows' Efficiency Mode / EcoQoS power
     throttling.
@@ -858,6 +897,11 @@ def standalone_autosplit_main(game, category, livesplit_url):
     then is the LiveSplit command sent and the next split becomes active.
     'start' sends 'starttimer'; every other split (including 'stop', which
     ends the run) sends 'split'.
+
+    Rearms back to 'start' both after 'stop' is reached and whenever
+    LiveSplit's timer is reset by anything other than this script (see
+    livesplit_reset_watcher), so repeated attempts don't need OBS or the
+    subprocess restarted between them.
     """
     category_dir = os.path.join(GAMES_DIR, game, category)
     splits_path = os.path.join(category_dir, SPLITS_FILENAME)
@@ -909,12 +953,35 @@ def standalone_autosplit_main(game, category, livesplit_url):
         daemon=True)
     grabber_thread.start()
 
+    reset_event = threading.Event()
+    stop_watching_reset = threading.Event()
+    reset_watcher_thread = threading.Thread(
+        target=livesplit_reset_watcher,
+        args=(livesplit_url, reset_event, stop_watching_reset), daemon=True)
+    reset_watcher_thread.start()
+
     key_index = 0
     image_index = 0
     read_failure_logged = False
     last_score_log = 0.0
     try:
-        while key_index < len(keys):
+        while True:
+            if key_index >= len(keys):
+                log("INFO",
+                    f"Autosplitter finished '{game}/{category}'; waiting "
+                    "for the next attempt")
+                key_index = 0
+                image_index = 0
+
+            if reset_event.is_set():
+                reset_event.clear()
+                if key_index > 0:
+                    log("INFO",
+                        "LiveSplit was reset; rearming autosplitter for "
+                        "the next attempt")
+                key_index = 0
+                image_index = 0
+
             ok, frame = latest_frame.get()
             if not ok or frame is None:
                 if not read_failure_logged:
@@ -957,12 +1024,11 @@ def standalone_autosplit_main(game, category, livesplit_url):
             key_index += 1
             image_index = 0
     finally:
+        stop_watching_reset.set()
+        reset_watcher_thread.join(timeout=2)
         stop_grabbing.set()
         grabber_thread.join(timeout=2)
         cap.release()
-
-    if key_index >= len(keys):
-        log("INFO", f"Autosplitter finished '{game}/{category}'")
 
 
 def read_autosplit_output(process):
