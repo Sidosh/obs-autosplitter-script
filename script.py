@@ -61,8 +61,10 @@ SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
 GAMES_DIR = os.path.join(SCRIPT_DIR, "games")
 SPLITS_FILENAME = "splits.json"
 
-# cv2.matchTemplate (TM_CCOEFF_NORMED) score above which a template counts
-# as detected in the current frame; tune per game if splits misfire.
+# cv2.matchTemplate (TM_CCOEFF_NORMED, or its masked equivalent for
+# templates with real PNG transparency - see prepare_masked_template)
+# score above which a template counts as detected in the current frame;
+# tune per game if splits misfire.
 MATCH_THRESHOLD = 0.9
 # An "images" list entry in splits.json may be either a filename (matched
 # against the full frame) or {filename: [x, y, w, h]} (pixels, in the
@@ -579,7 +581,11 @@ def game_changed(props, prop, settings):
 # --- Autosplitting (image matching) ------------------------------------------
 
 def load_template(path):
-    """Reads an image file as a cv2 (BGR) array.
+    """Reads an image file as (bgr, mask).
+
+    `bgr` is the cv2 BGR pixel data. `mask` is the source PNG's alpha
+    channel (255 = opaque, 0 = fully transparent) if it has one and it
+    isn't uniformly opaque, else None to match the whole image.
 
     cv2.imread() silently fails on Windows for paths containing
     non-ASCII characters (e.g. accented game names), so the file is read
@@ -589,10 +595,16 @@ def load_template(path):
     import numpy as np
 
     data = np.fromfile(path, dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    image = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
     if image is None:
         raise ValueError(f"Could not decode image: {path}")
-    return image
+    if image.ndim == 2:  # grayscale, no alpha
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), None
+    if image.shape[2] == 4:
+        alpha = image[:, :, 3]
+        mask = None if alpha.min() == 255 else alpha
+        return image[:, :, :3], mask
+    return image, None
 
 
 def crop_roi(frame, roi):
@@ -609,21 +621,82 @@ def crop_roi(frame, roi):
     return frame[y0:y1, x0:x1]
 
 
+def prepare_masked_template(bgr, mask):
+    """Precomputes the parts of a masked normalized cross-correlation that
+    only depend on the template, not the frame it's matched against later.
+
+    cv2.matchTemplate has no TM_CCOEFF_NORMED support for masked templates
+    (only TM_SQDIFF/TM_CCORR_NORMED), and TM_CCORR_NORMED alone has no mean
+    subtraction, so unlike TM_CCOEFF_NORMED its score for a genuine
+    non-match doesn't drop much below ~0.7-0.8. This reimplements
+    TM_CCOEFF_NORMED's formula restricted to the unmasked pixels, expanded
+    into a handful of unmasked cv2.matchTemplate(TM_CCORR) calls (see
+    masked_match_score) so the per-frame work still runs through cv2's own
+    optimized correlation rather than a Python pixel/window loop.
+    """
+    import numpy as np
+
+    m = mask.astype(np.float32) / 255.0
+    sum_m = float(m.sum())
+    bgr_f = bgr.astype(np.float32)
+    t_prime = np.empty_like(bgr_f)
+    for c in range(3):
+        mean_c = float((m * bgr_f[:, :, c]).sum() / sum_m)
+        t_prime[:, :, c] = m * (bgr_f[:, :, c] - mean_c)
+    denom_t = float((t_prime ** 2).sum())
+    return t_prime, m, sum_m, denom_t
+
+
+def masked_match_score(frame, masked_template):
+    """Best score of a masked_template (from prepare_masked_template)
+    against every position it fits in `frame`."""
+    import cv2
+    import numpy as np
+
+    t_prime, m, sum_m, denom_t = masked_template
+    frame_f = frame.astype(np.float32)
+    numerator = cv2.matchTemplate(frame_f, t_prime, cv2.TM_CCORR)
+
+    denom_i = np.zeros(numerator.shape, dtype=np.float32)
+    for c in range(3):
+        channel = frame_f[:, :, c]
+        s1 = cv2.matchTemplate(channel, m, cv2.TM_CCORR)
+        s2 = cv2.matchTemplate(channel ** 2, m, cv2.TM_CCORR)
+        denom_i += s2 - (s1 ** 2) / sum_m
+
+    denom = np.sqrt(np.maximum(denom_t * denom_i, 0)) + 1e-8
+    return float((numerator / denom).max())
+
+
+def prepare_template(bgr, mask):
+    """Wraps a loaded (bgr, mask) pair (see load_template) into whatever
+    match_score needs, precomputing the masked case's template-only work
+    once at load time instead of on every matched frame."""
+    if mask is None:
+        return bgr, None
+    return None, prepare_masked_template(bgr, mask)
+
+
 def match_score(frame, template, roi=None):
-    """Best matchTemplate score of `template` in `frame` (or within `roi`
-    if given), or None if the search area is too small for the template."""
+    """Best matchTemplate score of `template` (as returned by
+    prepare_template) in `frame` (or within `roi` if given), or None if
+    the search area is too small for the template."""
     import cv2
 
+    bgr, masked = template
     if roi is not None:
         frame = crop_roi(frame, roi)
         if frame is None:
             return None
-    th, tw = template.shape[:2]
+
+    th, tw = (bgr.shape[:2] if masked is None else masked[0].shape[:2])
     fh, fw = frame.shape[:2]
     if th > fh or tw > fw:
         return None
-    result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
-    return float(result.max())
+
+    if masked is None:
+        return float(cv2.matchTemplate(frame, bgr, cv2.TM_CCOEFF_NORMED).max())
+    return masked_match_score(frame, masked)
 
 
 def validate_roi(label, roi):
@@ -799,7 +872,7 @@ def standalone_autosplit_main(game, category, livesplit_url):
         rois = {}
         for key in keys:
             parsed = [parse_image_entry(key, entry) for entry in splits[key]["images"]]
-            templates[key] = [load_template(os.path.join(category_dir, "images", name))
+            templates[key] = [prepare_template(*load_template(os.path.join(category_dir, "images", name)))
                               for name, _ in parsed]
             rois[key] = [roi for _, roi in parsed]
     except (OSError, ValueError, KeyError) as e:
