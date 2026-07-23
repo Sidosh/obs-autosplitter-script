@@ -84,10 +84,9 @@ FLAT_TEMPLATE_STD = 2.0
 # How often the autosplitter re-reads the camera while a split's images
 # haven't matched yet.
 FRAME_POLL_INTERVAL_S = 0.01
-# How often a non-matching score is logged while waiting on a split image,
-# so misfires can be diagnosed from the script log without needing to
-# reproduce them under helper/preview_matches.py.
-SCORE_LOG_INTERVAL_S = 2
+# Full camera frames captured the moment a split image matches are written
+# here (one PNG per detection) so misfires can be inspected after the fact.
+DETECTIONS_DIR = os.path.join(SCRIPT_DIR, "detections")
 # How often the autosplitter checks whether the camera index / the
 # selected category's local files have become available.
 AUTOSPLIT_WAIT_S = 1
@@ -678,11 +677,12 @@ def masked_match_score(frame, masked_template):
     return float((numerator / denom).max())
 
 
-def flat_match_score(frame, template):
-    """Match score for a near-uniform-color `template` (see
-    FLAT_TEMPLATE_STD) against `frame`: 1 minus the single worst-matching
-    pixel's max-channel absolute difference from the template's own
-    (uniform) color, as a fraction of the 0-255 range.
+def flat_match_score(frame, color):
+    """Match score for a near-uniform-color template (see FLAT_TEMPLATE_STD)
+    against `frame`, given the template's precomputed per-channel `color`
+    (see prepare_template): 1 minus the single worst-matching pixel's
+    max-channel absolute difference from that color, as a fraction of the
+    0-255 range.
 
     Unlike match_score's other two branches, this does not slide the
     template across `frame` looking for the best-fitting position - every
@@ -692,24 +692,26 @@ def flat_match_score(frame, template):
     """
     import numpy as np
 
-    color = template.reshape(-1, template.shape[2]).mean(axis=0)
     worst_pixel_diff = float(np.abs(frame.astype(np.float32) - color).max())
     return 1.0 - worst_pixel_diff / 255
 
 
 def prepare_template(bgr, mask):
     """Wraps a loaded (bgr, mask) pair (see load_template) into whatever
-    match_score needs, precomputing the masked case's template-only work
-    once at load time instead of on every matched frame.
+    match_score needs, precomputing each case's template-only work once at
+    load time instead of on every matched frame.
 
     The second element of the returned tuple is the masked_match_score
-    data if `mask` was given, the string "flat" if the template is a
-    near-uniform color (see FLAT_TEMPLATE_STD), or else None.
+    data if `mask` was given, the template's precomputed per-channel color
+    if it is a near-uniform "flat" template (see FLAT_TEMPLATE_STD and
+    flat_match_score), or else None (a normal template matched with
+    cv2.matchTemplate directly).
     """
     if mask is not None:
         return None, prepare_masked_template(bgr, mask)
     if bgr.std() < FLAT_TEMPLATE_STD:
-        return bgr, "flat"
+        color = bgr.reshape(-1, bgr.shape[2]).mean(axis=0).astype("float32")
+        return bgr, color
     return bgr, None
 
 
@@ -732,8 +734,8 @@ def match_score(frame, template, roi=None):
 
     if bgr is None:
         return masked_match_score(frame, extra)
-    if extra == "flat":
-        return flat_match_score(frame, bgr)
+    if extra is not None:  # flat template: extra is its precomputed color
+        return flat_match_score(frame, extra)
     return float(cv2.matchTemplate(frame, bgr, cv2.TM_CCOEFF_NORMED).max())
 
 
@@ -897,15 +899,20 @@ class LatestFrame:
         self._lock = threading.Lock()
         self._ok = False
         self._frame = None
+        self._generation = 0
 
     def set(self, ok, frame):
         with self._lock:
             self._ok = ok
             self._frame = frame
+            self._generation += 1
 
     def get(self):
+        """Returns (ok, frame, generation). `generation` increments on every
+        set(), so the matching loop can tell a freshly grabbed frame from one
+        it has already scored and skip re-running matchTemplate on a repeat."""
         with self._lock:
-            return self._ok, self._frame
+            return self._ok, self._frame, self._generation
 
 
 def frame_grabber_loop(cap, latest, stop):
@@ -916,6 +923,33 @@ def frame_grabber_loop(cap, latest, stop):
         latest.set(ok, frame)
         if not ok:
             time.sleep(FRAME_POLL_INTERVAL_S)
+
+
+def save_detection_screenshot(frame, key, name):
+    """Saves the full camera `frame` captured the moment split `key`'s image
+    `name` matched into DETECTIONS_DIR, for after-the-fact inspection.
+
+    Returns the saved path, or None if it couldn't be written. Encodes to
+    bytes and writes them directly (rather than cv2.imwrite) so the path may
+    contain non-ASCII characters, which cv2 silently fails on for Windows
+    file I/O - the same reason load_template reads via np.fromfile.
+    """
+    import cv2
+
+    stem = os.path.splitext(name)[0]
+    filename = f"{time.strftime('%Y%m%d-%H%M%S')}_{key}_{stem}.png"
+    path = os.path.join(DETECTIONS_DIR, filename)
+    try:
+        os.makedirs(DETECTIONS_DIR, exist_ok=True)
+        ok, buf = cv2.imencode(".png", frame)
+        if not ok:
+            log("WARNING", "Could not encode detection screenshot")
+            return None
+        buf.tofile(path)
+    except (OSError, cv2.error) as e:
+        log("WARNING", f"Could not save detection screenshot: {e}")
+        return None
+    return path
 
 
 def standalone_autosplit_main(game, category, livesplit_url):
@@ -949,11 +983,13 @@ def standalone_autosplit_main(game, category, livesplit_url):
         keys = ordered_split_keys(splits)
         templates = {}
         rois = {}
+        names = {}
         for key in keys:
             parsed = [parse_image_entry(key, entry) for entry in splits[key]["images"]]
             templates[key] = [prepare_template(*load_template(os.path.join(category_dir, "images", name)))
                               for name, _ in parsed]
             rois[key] = [roi for _, roi in parsed]
+            names[key] = [name for name, _ in parsed]
     except (OSError, ValueError, KeyError) as e:
         log("ERROR", f"Could not load splits for '{game}/{category}': {e}")
         return
@@ -998,7 +1034,7 @@ def standalone_autosplit_main(game, category, livesplit_url):
     key_index = 0
     image_index = 0
     read_failure_logged = False
-    last_score_log = 0.0
+    last_scored = None  # (generation, key_index, image_index) last scored
     try:
         while True:
             if key_index >= len(keys):
@@ -1017,30 +1053,38 @@ def standalone_autosplit_main(game, category, livesplit_url):
                 key_index = 0
                 image_index = 0
 
-            ok, frame = latest_frame.get()
+            ok, frame, generation = latest_frame.get()
             if not ok or frame is None:
                 if not read_failure_logged:
                     log("WARNING",
                         "Camera read failed (no frames from the virtual "
                         "camera); will keep retrying")
                     read_failure_logged = True
+                last_scored = None
                 time.sleep(FRAME_POLL_INTERVAL_S)
                 continue
             read_failure_logged = False
 
-            key = keys[key_index]
-            score = match_score(frame, templates[key][image_index], rois[key][image_index])
-            if score is None or score < MATCH_THRESHOLD:
-                now = time.monotonic()
-                if now - last_score_log >= SCORE_LOG_INTERVAL_S:
-                    name, _ = parse_image_entry(key, splits[key]["images"][image_index])
-                    shown = "n/a (roi outside frame)" if score is None else f"{score:.3f}"
-                    log("INFO",
-                        f"Waiting on '{key}' image '{name}', "
-                        f"score={shown} (need {MATCH_THRESHOLD})")
-                    last_score_log = now
+            # Skip re-scoring a frame already judged against the same image:
+            # match_score is deterministic, so a repeat can only reproduce the
+            # previous non-match (a match would have advanced the indices).
+            scored = (generation, key_index, image_index)
+            if scored == last_scored:
                 time.sleep(FRAME_POLL_INTERVAL_S)
                 continue
+            last_scored = scored
+
+            key = keys[key_index]
+            name = names[key][image_index]
+            score = match_score(frame, templates[key][image_index], rois[key][image_index])
+            if score is None or score < MATCH_THRESHOLD:
+                time.sleep(FRAME_POLL_INTERVAL_S)
+                continue
+
+            saved = save_detection_screenshot(frame, key, name)
+            where = f", saved {os.path.basename(saved)}" if saved else ""
+            log("INFO",
+                f"Detected '{key}' image '{name}', score={score:.3f}{where}")
 
             image_index += 1
             if image_index < len(templates[key]):
@@ -1073,13 +1117,11 @@ def read_autosplit_output(process):
         line = line.rstrip("\n")
         if not line:
             continue
+        # Lines are "LEVEL: message" (see log()); anything without a known
+        # level prefix is relayed verbatim as INFO.
         level, sep, msg = line.partition(": ")
-        if sep and level == "ERROR":
-            log("ERROR", msg)
-        elif sep and level == "WARNING":
-            log("WARNING", msg)
-        elif sep and level == "INFO":
-            log("INFO", msg)
+        if sep and level in OBS_LOG_LEVELS:
+            log(level, msg)
         else:
             log("INFO", line)
 
