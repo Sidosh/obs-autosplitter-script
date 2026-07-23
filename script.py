@@ -68,7 +68,14 @@ SPLITS_FILENAME = "splits.json"
 # templates with real PNG transparency - see prepare_masked_template)
 # score above which a template counts as detected in the current frame;
 # tune per game if splits misfire.
-MATCH_THRESHOLD = 0.9
+MATCH_THRESHOLD = 0.85
+# A template's own pixel std (0-255 scale) below this counts as "flat"
+# (e.g. a plain solid-color reference image, like a white flash screen).
+# TM_CCOEFF_NORMED normalizes by the template's own variance, so a flat
+# template makes cv2 short-circuit to a score of 1.0 for every position
+# regardless of what's actually in the frame - flat templates are matched
+# by direct pixel-color comparison instead (see flat_match_score).
+FLAT_TEMPLATE_STD = 2.0
 # An "images" list entry in splits.json may be either a filename (matched
 # against the full frame) or {filename: [x, y, w, h]} (pixels, in the
 # camera frame's own coordinate space) to restrict matchTemplate to that
@@ -671,13 +678,39 @@ def masked_match_score(frame, masked_template):
     return float((numerator / denom).max())
 
 
+def flat_match_score(frame, template):
+    """Match score for a near-uniform-color `template` (see
+    FLAT_TEMPLATE_STD) against `frame`: 1 minus the single worst-matching
+    pixel's max-channel absolute difference from the template's own
+    (uniform) color, as a fraction of the 0-255 range.
+
+    Unlike match_score's other two branches, this does not slide the
+    template across `frame` looking for the best-fitting position - every
+    splits.json entry pairs a flat template with a same-size roi, so
+    `frame` (already cropped to that roi by match_score) is the single
+    region being judged.
+    """
+    import numpy as np
+
+    color = template.reshape(-1, template.shape[2]).mean(axis=0)
+    worst_pixel_diff = float(np.abs(frame.astype(np.float32) - color).max())
+    return 1.0 - worst_pixel_diff / 255
+
+
 def prepare_template(bgr, mask):
     """Wraps a loaded (bgr, mask) pair (see load_template) into whatever
     match_score needs, precomputing the masked case's template-only work
-    once at load time instead of on every matched frame."""
-    if mask is None:
-        return bgr, None
-    return None, prepare_masked_template(bgr, mask)
+    once at load time instead of on every matched frame.
+
+    The second element of the returned tuple is the masked_match_score
+    data if `mask` was given, the string "flat" if the template is a
+    near-uniform color (see FLAT_TEMPLATE_STD), or else None.
+    """
+    if mask is not None:
+        return None, prepare_masked_template(bgr, mask)
+    if bgr.std() < FLAT_TEMPLATE_STD:
+        return bgr, "flat"
+    return bgr, None
 
 
 def match_score(frame, template, roi=None):
@@ -686,20 +719,22 @@ def match_score(frame, template, roi=None):
     the search area is too small for the template."""
     import cv2
 
-    bgr, masked = template
+    bgr, extra = template
     if roi is not None:
         frame = crop_roi(frame, roi)
         if frame is None:
             return None
 
-    th, tw = (bgr.shape[:2] if masked is None else masked[0].shape[:2])
+    th, tw = (extra[0].shape[:2] if bgr is None else bgr.shape[:2])
     fh, fw = frame.shape[:2]
     if th > fh or tw > fw:
         return None
 
-    if masked is None:
-        return float(cv2.matchTemplate(frame, bgr, cv2.TM_CCOEFF_NORMED).max())
-    return masked_match_score(frame, masked)
+    if bgr is None:
+        return masked_match_score(frame, extra)
+    if extra == "flat":
+        return flat_match_score(frame, bgr)
+    return float(cv2.matchTemplate(frame, bgr, cv2.TM_CCOEFF_NORMED).max())
 
 
 def validate_roi(label, roi):
